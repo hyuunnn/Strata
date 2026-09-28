@@ -4,10 +4,26 @@ rem Needs only an NVIDIA driver. Python is installed for your user account if it
 setlocal
 title Strata
 cd /d "%~dp0"
-if exist ".venv\Scripts\python.exe" goto run
+set "OFFLINE_MODE="
+set "BUNDLE_DIR="
+set "EXPORTING="
+call :parse_offline %*
+if exist "offline\OFFLINE.json" if not defined EXPORTING (
+  if not defined BUNDLE_DIR set "BUNDLE_DIR=%cd%\offline"
+  set "OFFLINE_MODE=1"
+)
+if exist ".venv\Scripts\python.exe" (
+  ".venv\Scripts\python.exe" -c "import sys" >nul 2>nul
+  if not errorlevel 1 goto run
+  echo  The copied Python environment does not work on this PC. Creating a new one ...
+  rmdir /s /q .venv
+)
 
 call :findpy
 if defined PY goto venv
+if defined EXPORTING goto py_online
+if defined OFFLINE_MODE goto py_offline
+:py_online
 echo.
 echo  Python 3.10 or newer is not installed. Installing Python 3.12 for your user account ...
 where winget >nul 2>nul
@@ -28,6 +44,23 @@ echo  then double-click START-HERE.bat again.
 pause
 exit /b 1
 
+:py_offline
+set "PYINST="
+if defined BUNDLE_DIR if exist "%BUNDLE_DIR%\python\python-3.12.10-amd64.exe" set "PYINST=%BUNDLE_DIR%\python\python-3.12.10-amd64.exe"
+if not defined PYINST if exist "offline\python\python-3.12.10-amd64.exe" set "PYINST=offline\python\python-3.12.10-amd64.exe"
+if defined PYINST (
+  echo  Installing Python 3.12 from the offline pack ...
+  "%PYINST%" /quiet InstallAllUsers=0 PrependPath=1 Include_launcher=1 Include_test=0
+  call :findpy
+  if defined PY goto venv
+)
+echo.
+echo  Offline mode: Python 3.10+ is not installed and no installer is in the offline pack.
+echo  On a PC with internet run:  START-HERE.bat --export-offline
+echo  Copy offline\ here, or install 64-bit Python 3.12 and run this again.
+pause
+exit /b 1
+
 :venv
 rem a private environment inside this folder, so nothing is installed into the system Python
 %PY% -m venv .venv
@@ -37,6 +70,14 @@ pause
 exit /b 1
 
 :run
+if defined OFFLINE_MODE (
+  echo %*| findstr /I /C:"--offline" /C:"--bundle" >nul
+  if errorlevel 1 (
+    ".venv\Scripts\python.exe" setup.py --offline %*
+    if errorlevel 1 pause
+    exit /b
+  )
+)
 ".venv\Scripts\python.exe" setup.py %*
 if errorlevel 1 pause
 exit /b
@@ -50,3 +91,14 @@ python -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) and sys.maxsize
 if not errorlevel 1 set "PY=python" & goto :eof
 for %%V in (313 312 311 310) do if exist "%LOCALAPPDATA%\Programs\Python\Python%%V\python.exe" set "PY="%LOCALAPPDATA%\Programs\Python\Python%%V\python.exe"" & goto :eof
 goto :eof
+
+:parse_offline
+if "%~1"=="" goto :eof
+if /I "%~1"=="--offline" set "OFFLINE_MODE=1"
+if /I "%~1"=="--bundle" (
+  set "OFFLINE_MODE=1"
+  set "BUNDLE_DIR=%~2"
+)
+if /I "%~1"=="--export-offline" set "EXPORTING=1"
+shift
+goto parse_offline

@@ -4,7 +4,7 @@ The technical side of Strata: every measured number, the API, images, all settin
 New here? Start with the [README](../README.md) - it has everything you need to install and use it.
 
 > **On this page:** [Speed](#speed-measured) · [Other GPUs](#other-gpus-estimated) · [Which model?](#which-model) ·
-> [Requirements](#before-you-start) · [Windows](#windows) · [Linux](#linux) · [API](#using-it) · [Images](#images-vision) ·
+> [Requirements](#before-you-start) · [Windows](#windows) · [Linux](#linux) · [Closed network](#closed-network-no-internet) · [API](#using-it) · [Images](#images-vision) ·
 > [Troubleshooting](#troubleshooting) · [How it works](#how-it-works)
 
 ---
@@ -162,6 +162,8 @@ downloaded again. Closing the window stops the model.
 START-HERE.bat --setup                          install another model, or change context / images
 START-HERE.bat --model IQ2_XS --context 32768 --vision yes --yes     no questions
 START-HERE.bat --gguf-dir D:\models\IQ2_XS       use GGUF files you already have
+START-HERE.bat --export-offline                 pack engine/wheels/MTP for a USB copy
+START-HERE.bat --offline --gguf-dir D:\models\IQ2_XS --yes    closed network (see below)
 START-HERE.bat --port 8081                      another port
 ```
 
@@ -194,6 +196,63 @@ Terminal chat: `.venv/bin/python chat.py`.
 - **WSL** works (Ubuntu 24.04 tested), with one limit: the NVIDIA driver pins only about 1 GB of RAM there, so KV
   streaming (`--kv-resident`) is off and the KV cache stays in VRAM, and the experts are copied to the GPU from
   unpinned RAM (slower prompts than native Linux).
+
+---
+
+## Closed network (no internet)
+
+Strata's first install normally downloads the engine, Python packages, the model and the MTP draft layer. On a
+closed network those downloads fail. The model GGUF files you already copied are enough for the weights; the rest
+is a small pack you make once on a PC with internet and move on a USB drive.
+
+**On the laptop (internet):**
+
+```
+START-HERE.bat --export-offline
+```
+
+(or `./setup.sh --export-offline` on Linux.) This writes `offline\` next to `START-HERE.bat`:
+
+| In the pack | What it is |
+| --- | --- |
+| `strata-windows-x64.zip` / `strata-linux-x64.zip` | ready-made engine |
+| `llama.cpp-*.zip` | source the packer tools need |
+| `wheels\` | pip packages, including NVIDIA's CUDA libraries |
+| `mtp\rt\` | MTP draft layer (speculative decoding) |
+| `python\python-3.12.10-amd64.exe` | Windows only: Python installer |
+| `data\` | `expert-profile.bin` / `draft_vocab.bin` when they are in this tree |
+
+The ~70 GB model is **not** in the pack. Pass `--export-offline E:\usb\strata-offline` to write the pack onto a USB
+drive instead of `.\offline`.
+
+**Copy to the closed PC:** the Strata source folder, the `offline\` pack, and the two GGUF shards (already there, or
+copied separately). The NVIDIA driver (580+) must already be installed.
+
+**On the closed PC:**
+
+```
+START-HERE.bat --offline --gguf-dir D:\models\IQ2_XS --yes
+```
+
+`--gguf-dir` is any folder that contains both shards (the exact names, e.g.
+`Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf` and `-00002-of-00002.gguf`). A Hugging Face snapshot folder
+works: setup walks a few levels to find those names.
+
+If the pack is not at `Strata\offline\`:
+
+```
+START-HERE.bat --offline --bundle E:\usb\strata-offline --gguf-dir D:\models\IQ2_XS --yes
+```
+
+`--offline` never opens the network. A copied `.venv` from another PC is thrown away and remade from the wheels.
+If you copy a finished install (including `packs\`, `mtp\`, `engine\` and `strata-*.json`) to a new drive letter,
+the next start rewrites the paths in the JSON so they point at this folder.
+
+Linux: `./setup.sh --offline --gguf-dir /data/IQ2_XS --yes`. Python 3.10+ with venv must already be on that PC
+(the distro's package archive); the pack does not include a Linux Python installer.
+
+Other flags: `--wheels-dir DIR` (pip `--find-links`), `--mtp-dir DIR` (a folder that already has `rt\experts.bin`),
+`--prebuilt DIR` (folder that holds the engine zip). `STRATA_OFFLINE=1` is the same as `--offline`.
 
 ---
 
@@ -400,6 +459,7 @@ the document, +0.4% on the chat. Details: `bench/results/2026-09-27-esp/`.
 | Slow output, disk light busy | Not enough free RAM: close other programs, or choose Q2_0 / IQ2_XS. |
 | `prompt ... exceeds the context` | The request is longer than the context you chose: run setup again with a bigger `--context`. |
 | Slower than the tables | The monitor plugged into the GPU and other GPU programs take VRAM from the expert cache; RAM running below its rated speed (enable EXPO/XMP in the BIOS) slows the CPU half. |
+| `offline: missing ...` / cannot reach huggingface / github | This PC has no internet. On a laptop run `START-HERE.bat --export-offline`, copy `offline\` and the two GGUF shards, then `START-HERE.bat --offline --gguf-dir <folder> --yes`. See [Closed network](#closed-network-no-internet). |
 | `this server was started without the vision encoder` | The model was set up for text only: run setup again with `--vision gpu`. |
 | A picture is refused or `cannot read the image` | The file is not a picture Pillow can open (JPEG, PNG, WebP, GIF, BMP, TIFF, AVIF work). |
 | Pictures are slow (10-30 s) | The encoder runs on the CPU: run setup again with `--vision gpu` (needs ~1.4 GB of VRAM). |

@@ -24,7 +24,9 @@ answers, no questions), --setup (install another model / change settings instead
 --host 0.0.0.0 --api-key KEY (reach it from other devices on your network), --experimental-speed-projection on|off
 (EXPERIMENTAL, off by default),
 --models-dir DIR, --gguf-dir DIR (use GGUF files you already have), --build (compile instead of the ready-made
-engine), --check (only check this PC).
+engine), --check (only check this PC),
+--offline (no internet: local files only), --export-offline [DIR] (on a PC with internet: pack the engine, wheels,
+MTP and a Python installer to copy to a closed network), --bundle DIR (that pack), --wheels-dir DIR, --mtp-dir DIR.
 """
 from __future__ import annotations
 
@@ -56,6 +58,9 @@ PREBUILT_URL = "https://github.com/Niko1221/Strata/releases/latest/download/"
 PREBUILT_ASSET = "strata-windows-x64.zip" if WIN else "strata-linux-x64.zip"
 # the CUDA libraries the ready-made engine loads (the same CUDA 13.0 it is built with), from NVIDIA's pip packages
 CUDA_WHEELS = ["nvidia-cublas==13.0.2.14", "nvidia-cuda-runtime==13.0.96"]
+# Windows Python installer copied by --export-offline so a closed-network PC can create .venv
+PY_INSTALLER_URL = "https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe"
+PY_INSTALLER_NAME = "python-3.12.10-amd64.exe"
 MIN_DRIVER = 580                       # CUDA 13.0
 MIN_ENGINE = (0, 1, 14)                # v0.1.14: no host CUDA call inside a verify window (#31); v0.1.13: --prefill auto
 PY_PACKAGES = ["numpy", "jinja2", "regex", "pyyaml", "tqdm", "requests", "cmake", "ninja", "pillow", "psutil"]
@@ -97,6 +102,11 @@ VISION = {"gpu": {"max_tokens": 1024, "reserve_mib": 700},
           "cpu": {"max_tokens": 300, "reserve_mib": 700}}
 EXE = "strata.exe" if WIN else "strata"
 VEXE = "strata-vision.exe" if WIN else "strata-vision"
+# set by main() for a closed-network run / an --export-offline pack
+OFFLINE = False
+WHEELS_DIR = None          # Path | None: pip --find-links
+LLAMA_ZIP = None           # Path | None: llama.cpp source zip, instead of GitHub
+MTP_SRC = None             # Path | None: already-prepared MTP (rt/experts.bin)
 
 
 # ------------------------------------------------------------------------------------------------ output
@@ -288,21 +298,28 @@ def free_gb(path):
 
 
 # ------------------------------------------------------------------------------------------------ downloads
-def download(url, dst: Path, what=None):
+def download(url, dst: Path, what=None, required=True):
     """Resumable HTTP(S) download with a progress line; `file://` and plain paths are copied (tests, mirrors).
     A finished file gets a <name>.done mark, so a later run skips it without asking the server."""
     dst.parent.mkdir(parents=True, exist_ok=True)
     if dst.exists() and done(dst):
         ok(f"{what or dst.name} already downloaded")
-        return
+        return True
     if not url.startswith(("http://", "https://")):
         src = Path(url[7:] if url.startswith("file://") else url)
         if not src.exists():
+            if not required:
+                return False
             fail(f"not found: {src}")
         shutil.copyfile(src, dst)
         mark(dst)
         ok(f"{what or dst.name} copied")
-        return
+        return True
+    if OFFLINE:
+        if not required:
+            return False
+        fail(f"offline: {what or dst.name} is not on this PC",
+             "copy it from the laptop pack (--export-offline / --bundle) or pass a local path")
     part = dst.with_name(dst.name + ".part")
     total = 0
     for attempt in range(5):
@@ -312,12 +329,15 @@ def download(url, dst: Path, what=None):
             break
         except OSError as e:
             if attempt == 4:
+                if not required:
+                    warn(f"cannot reach {url.split('/')[2]} ({e})")
+                    return False
                 fail(f"cannot reach {url.split('/')[2]} ({e})", "check your internet connection and run it again")
             time.sleep(5)
     if dst.exists() and total and dst.stat().st_size == total:    # finished by an older setup (no mark yet)
         mark(dst)
         ok(f"{what or dst.name} already downloaded")
-        return
+        return True
     have = part.stat().st_size if part.exists() else 0
     for attempt in range(30):
         try:
@@ -346,11 +366,15 @@ def download(url, dst: Path, what=None):
             print()
             warn(f"download interrupted ({e}); retrying in 10 s ...")
             time.sleep(10)
-    if total and part.stat().st_size != total:
+    if total and (not part.exists() or part.stat().st_size != total):
+        if not required:
+            warn(f"could not finish downloading {dst.name}")
+            return False
         fail(f"could not finish downloading {dst.name}", "check your internet connection and run it again")
     part.replace(dst)
     mark(dst)
     ok(f"{what or dst.name} downloaded")
+    return True
 
 
 def get_llama_cpp():
@@ -359,7 +383,8 @@ def get_llama_cpp():
     if (llama / "ggml" / "CMakeLists.txt").exists() and (llama / "gguf-py").is_dir():
         return llama
     z = ROOT / "third_party" / f"llama.cpp-{LLAMA_CPP_COMMIT[:7]}.zip"
-    download(LLAMA_CPP_ZIP, z, "llama.cpp source")
+    src = str(LLAMA_ZIP) if LLAMA_ZIP else LLAMA_CPP_ZIP
+    download(src, z, "llama.cpp source")
     tmp = ROOT / "third_party" / "_unpack"
     shutil.rmtree(tmp, ignore_errors=True)
     with zipfile.ZipFile(z) as f:
@@ -382,7 +407,13 @@ def pip_install(packages, what):
         ok(f"{what} already installed")
         return
     say(f"  Installing {what} ...")
-    run([sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check", *need])
+    cmd = [sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check"]
+    if WHEELS_DIR:
+        cmd += ["--no-index", "--find-links", str(WHEELS_DIR)]
+    elif OFFLINE:
+        fail("Python packages are missing and there is no wheels folder",
+             "on a PC with internet: START-HERE.bat --export-offline   then copy offline\\ here and pass --bundle")
+    run([*cmd, *need])
     stamp.write_text(json.dumps(sorted(set(have) | set(need)), indent=0))
     ok(f"{what} installed")
 
@@ -423,6 +454,8 @@ def get_prebuilt(url_base, gpu, vision) -> Path | None:
     z = ROOT / "engine" / PREBUILT_ASSET
     base = url_base if url_base.endswith(("/", "\\")) else url_base + "/"
     if base.startswith(("http://", "https://")):
+        if OFFLINE:
+            return None
         try:                                           # not published (yet), or no internet: compile instead
             req = urllib.request.Request(base + PREBUILT_ASSET, method="HEAD", headers={"User-Agent": "strata-setup"})
             urllib.request.urlopen(req, timeout=60).close()
@@ -714,6 +747,7 @@ def upgrade_config(cfg_path: Path, cfg: dict) -> dict:
 
 def start(cfg_path: Path, port: int | None, open_browser=True) -> int:
     cfg = upgrade_config(cfg_path, json.loads(cfg_path.read_text(encoding="utf-8-sig")))
+    cfg = relocate_config(cfg_path, cfg)
     missing = [p for p in [cfg["exe"], *[a for a in cfg["args"] if a.endswith(".gguf")]] if not Path(p).exists()]
     if missing:
         fail(f"{cfg_path.name} refers to missing files: {missing[0]}", "run it again with --setup to repair")
@@ -742,6 +776,249 @@ def write_run_script(model, cfg_path, port):
     return script
 
 
+# ------------------------------------------------------------------------------------------------ offline / closed network
+def _find_named(root: Path, name: str, depth=4):
+    """Look for `name` in root, then a few directory levels down (HF snapshot folders, USB copies)."""
+    hit = root / name
+    if hit.is_file():
+        return hit
+    if depth <= 0 or not root.is_dir():
+        return None
+    try:
+        kids = sorted(root.iterdir(), key=lambda p: p.name.lower())
+    except OSError:
+        return None
+    for child in kids:
+        if child.is_dir() and not child.name.startswith(".") and child.name not in (".venv", "engine", "packs"):
+            found = _find_named(child, name, depth - 1)
+            if found:
+                return found
+    return None
+
+
+def find_model_files(fam, model, models_dir: Path, gguf_dir: Path | None):
+    """The two GGUF shards: exact folder first, then a short walk so a copied HF tree still works."""
+    names = [fam["file"].format(q=model, i=i) for i in (1, 2)]
+    tag = fam["tag"] + model
+    roots = []
+    if gguf_dir:
+        p = Path(gguf_dir)
+        roots += [p, p / model, p / tag]
+    md = Path(models_dir)
+    roots += [md / tag, md / model, md]
+    seen, search = set(), []
+    for r in roots:
+        key = str(r)
+        if key not in seen:
+            seen.add(key)
+            search.append(r)
+    found = []
+    for name in names:
+        hit = None
+        for root in search:
+            hit = _find_named(root, name)
+            if hit:
+                break
+        found.append(hit)
+    return found
+
+
+def find_mmproj(fam, models_dir: Path, gguf_dir: Path | None):
+    name = fam["mmproj"]
+    roots = [Path(models_dir)]
+    if gguf_dir:
+        roots.insert(0, Path(gguf_dir))
+    for root in roots:
+        hit = _find_named(root, name)
+        if hit:
+            return hit
+    return Path(models_dir) / name
+
+
+def gguf_ready(path: Path) -> bool:
+    """A copied shard has no .done mark; size is enough to tell it from an empty placeholder."""
+    return path.is_file() and path.stat().st_size > 1_000_000
+
+
+def install_mtp_from(src: Path, dest: Path) -> bool:
+    """Copy an already-prepared MTP tree (`rt/experts.bin`) into dest. src may be the tree or the rt folder."""
+    src = Path(src)
+    if (src / "rt" / "experts.bin").is_file():
+        if src.resolve() != dest.resolve():
+            dest.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(src / "rt", dest / "rt", dirs_exist_ok=True)
+        return True
+    if (src / "experts.bin").is_file():
+        if src.resolve() != (dest / "rt").resolve():
+            shutil.copytree(src, dest / "rt", dirs_exist_ok=True)
+        return True
+    return False
+
+
+def relocate_config(cfg_path: Path, cfg: dict) -> dict:
+    """A copied install keeps absolute paths from the laptop; rewrite ones that lived under the old cwd."""
+    old = Path(cfg.get("cwd") or "")
+    changed = False
+
+    def rewrite(value):
+        if not isinstance(value, str) or not value:
+            return value
+        path = Path(value)
+        if path.exists():
+            return value
+        if not old:
+            return value
+        try:
+            rel = Path(os.path.normpath(value)).resolve().relative_to(old.resolve())
+        except ValueError:
+            return value
+        return str(ROOT / rel)
+
+    if old and old.resolve() != ROOT.resolve():
+        cfg["exe"] = rewrite(cfg.get("exe"))
+        cfg["cwd"] = str(ROOT)
+        cfg["tokenizer"] = rewrite(cfg.get("tokenizer", ""))
+        cfg["log"] = rewrite(cfg.get("log", ""))
+        cfg["args"] = [rewrite(x) if isinstance(x, str) else x for x in cfg.get("args", [])]
+        if isinstance(cfg.get("vision"), dict):
+            for k in ("exe", "mmproj", "model"):
+                if k in cfg["vision"]:
+                    cfg["vision"][k] = rewrite(cfg["vision"][k])
+        changed = True
+        ok(f"paths updated for this folder ({ROOT})")
+    libs = [d for d in (cfg.get("lib_dirs") or []) if Path(d).is_dir()]
+    if not libs:
+        libs = cuda_lib_dirs()
+        if libs:
+            cfg["lib_dirs"] = libs
+            changed = True
+    elif libs != cfg.get("lib_dirs"):
+        cfg["lib_dirs"] = libs
+        changed = True
+    if changed:
+        cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+    return cfg
+
+
+def resolve_bundle(cli: str | None) -> Path | None:
+    if cli:
+        p = Path(cli).expanduser()
+        if not p.is_dir():
+            fail(f"offline pack not found: {p}")
+        return p.resolve()
+    for cand in (ROOT / "offline",):
+        if (cand / "OFFLINE.json").is_file() or (cand / "wheels").is_dir() or (cand / PREBUILT_ASSET).is_file():
+            return cand.resolve()
+    return None
+
+
+def apply_bundle(bundle: Path, prebuilt: str) -> str:
+    """Point llama / wheels / MTP / the engine zip at an --export-offline folder. Returns --prebuilt."""
+    global WHEELS_DIR, LLAMA_ZIP, MTP_SRC
+    wheels = bundle / "wheels"
+    if wheels.is_dir() and WHEELS_DIR is None:
+        WHEELS_DIR = wheels
+        ok(f"wheels: {wheels}")
+    zips = sorted(bundle.glob("llama.cpp-*.zip")) + sorted((bundle / "llama").glob("llama.cpp-*.zip")
+                                                           if (bundle / "llama").is_dir() else [])
+    if zips and LLAMA_ZIP is None:
+        LLAMA_ZIP = zips[0]
+        ok(f"llama.cpp zip: {LLAMA_ZIP.name}")
+    for mtp in (bundle / "mtp", bundle / "mtp" / "rt"):
+        if MTP_SRC is None and ((mtp / "rt" / "experts.bin").is_file() or (mtp / "experts.bin").is_file()):
+            MTP_SRC = bundle / "mtp" if (bundle / "mtp" / "rt" / "experts.bin").is_file() else mtp
+            ok(f"MTP: {MTP_SRC}")
+            break
+    for name in ("expert-profile.bin", "draft_vocab.bin"):
+        src, dst = bundle / "data" / name, ROOT / "data" / name
+        if src.is_file() and not dst.is_file():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            ok(f"copied {name}")
+    default = os.environ.get("STRATA_PREBUILT_URL", PREBUILT_URL)
+    if prebuilt == default:
+        for folder in (bundle, bundle / "engine"):
+            if (folder / PREBUILT_ASSET).is_file():
+                ok(f"engine zip: {folder / PREBUILT_ASSET}")
+                return str(folder)
+    return prebuilt
+
+
+def export_offline(dest: Path) -> int:
+    """Download everything except the ~70 GB model into dest, so a USB copy is enough on a closed network."""
+    dest = dest.expanduser().resolve()
+    dest.mkdir(parents=True, exist_ok=True)
+    say(f"Packing an offline folder at {dest}")
+    say("  (the model GGUF files are not copied: point --gguf-dir at the ones already on the closed PC)")
+    step(1, "ready-made engine")
+    if not download((PREBUILT_URL if PREBUILT_URL.endswith("/") else PREBUILT_URL + "/") + PREBUILT_ASSET,
+                    dest / PREBUILT_ASSET, "Strata engine", required=False):
+        warn("no ready-made engine downloaded: on the closed PC the engine will have to be compiled")
+    step(2, "llama.cpp source")
+    download(LLAMA_CPP_ZIP, dest / f"llama.cpp-{LLAMA_CPP_COMMIT[:7]}.zip", "llama.cpp source")
+    step(3, "Python wheels")
+    wheels = dest / "wheels"
+    wheels.mkdir(exist_ok=True)
+    run([sys.executable, "-m", "pip", "download", "--disable-pip-version-check", "-d", str(wheels),
+         *PY_PACKAGES, *CUDA_WHEELS])
+    ok(f"wheels: {wheels}")
+    if WIN:
+        step(4, "Python installer")
+        download(PY_INSTALLER_URL, dest / "python" / PY_INSTALLER_NAME, "Python 3.12 installer")
+    step(5, "MTP draft layer")
+    mtp, rt = ROOT / "mtp", ROOT / "mtp" / "rt"
+    if not (rt / "experts.bin").is_file():
+        pip_install(PY_PACKAGES, "numpy, jinja2, regex, pyyaml, tqdm, requests, cmake, ninja, pillow, psutil")
+        llama = get_llama_cpp()
+        env = dict(os.environ, STRATA_GGUF_PY=str(llama / "gguf-py"))
+        say("  Fetching the MTP tensors from the original Qwen checkpoint (~5 GB, once) ...")
+        run([sys.executable, str(ROOT / "tools" / "mtp_fetch.py"), "fetch", "--out", str(mtp)], env=env)
+        run([sys.executable, str(ROOT / "tools" / "mtp_pack.py"), "--src", str(mtp), "--experts", "q2_0",
+             "--out", str(mtp / "mtp-q2_0.gguf")], env=env)
+        run([sys.executable, str(ROOT / "tools" / "mtp_rt.py"), "--gguf", str(mtp / "mtp-q2_0.gguf"),
+             "--out", str(rt)], env=env)
+        if not (rt / "draft_vocab.bin").exists() and (ROOT / "data" / "draft_vocab.bin").exists():
+            shutil.copyfile(ROOT / "data" / "draft_vocab.bin", rt / "draft_vocab.bin")
+    if (rt / "experts.bin").is_file():
+        shutil.copytree(rt, dest / "mtp" / "rt", dirs_exist_ok=True)
+        ok(f"MTP: {dest / 'mtp' / 'rt'}")
+    else:
+        warn("MTP was not packed; the closed PC will need mtp/rt/experts.bin")
+    step(6, "shipped data files")
+    for name in ("expert-profile.bin", "draft_vocab.bin"):
+        src = ROOT / "data" / name
+        if src.is_file():
+            (dest / "data").mkdir(exist_ok=True)
+            shutil.copy2(src, dest / "data" / name)
+            ok(name)
+        else:
+            warn(f"{name} is not in this tree (it ships with the release zip)")
+    how = "START-HERE.bat" if WIN else "./setup.sh"
+    readme = dest / "README.txt"
+    readme.write_text(
+        "Strata offline pack\n"
+        "===================\n\n"
+        "On the closed-network PC:\n"
+        "  1. Copy the Strata folder (this repository) there.\n"
+        "  2. Copy this pack next to it, or into Strata\\offline\\\n"
+        "  3. The model GGUF shards must already be on that PC.\n"
+        "  4. Run:\n"
+        f"       {how} --offline --bundle <this folder> --gguf-dir <folder with the two .gguf files> --yes\n\n"
+        "If this pack is at Strata\\offline\\ you can omit --bundle.\n"
+        "NVIDIA driver 580+ must already be installed on the closed PC.\n",
+        encoding="utf-8")
+    (dest / "OFFLINE.json").write_text(json.dumps({
+        "version": 1, "os": "windows" if WIN else "linux", "engine": PREBUILT_ASSET,
+        "llama": f"llama.cpp-{LLAMA_CPP_COMMIT[:7]}.zip",
+        "mtp": (dest / "mtp" / "rt" / "experts.bin").is_file(),
+        "wheels": True, "python": f"python/{PY_INSTALLER_NAME}" if WIN else None,
+    }, indent=1), encoding="utf-8")
+    say()
+    say(f"Offline pack ready: {dest}")
+    say(f"  Copy this folder and the Strata source to the closed PC, then run {how} --offline --bundle \"{dest}\"")
+    return 0
+
+
 # ------------------------------------------------------------------------------------------------ main
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -762,6 +1039,15 @@ def main() -> int:
     ap.add_argument("--api-key", help="require this key from clients (recommended with --host 0.0.0.0)")
     ap.add_argument("--models-dir", default=str(ROOT / "models"), help="where the GGUF files go (~70 GB)")
     ap.add_argument("--gguf-dir", help="use GGUF files you already have (a folder with the two shards)")
+    ap.add_argument("--offline", action="store_true",
+                    help="no internet: use local GGUF / engine / wheels / MTP only (see --export-offline)")
+    ap.add_argument("--export-offline", nargs="?", const=str(ROOT / "offline"), metavar="DIR",
+                    help="on a PC with internet: pack the engine, wheels, MTP and a Python installer into DIR "
+                         "(default: ./offline) to copy to a closed network")
+    ap.add_argument("--bundle", metavar="DIR",
+                    help="offline pack from --export-offline (implies --offline)")
+    ap.add_argument("--wheels-dir", help="folder of pip wheels for a closed network")
+    ap.add_argument("--mtp-dir", help="already-prepared MTP folder (rt/experts.bin); skips the Hugging Face fetch")
     ap.add_argument("--yes", action="store_true", help="accept the recommended answers")
     ap.add_argument("--setup", action="store_true", help="install another model or change settings")
     ap.add_argument("--no-start", action="store_true", help="install only, do not start the model")
@@ -773,12 +1059,39 @@ def main() -> int:
     a = ap.parse_args()
     port = a.port or 8080                              # a new install's port (issue #32: --port for an existing one)
 
+    if a.export_offline:
+        return export_offline(Path(a.export_offline))
+
+    global OFFLINE, WHEELS_DIR, MTP_SRC
+    OFFLINE = bool(a.offline or a.bundle or os.environ.get("STRATA_OFFLINE"))
+    if a.wheels_dir:
+        WHEELS_DIR = Path(a.wheels_dir).expanduser().resolve()
+        if not WHEELS_DIR.is_dir():
+            fail(f"wheels folder not found: {WHEELS_DIR}")
+    if a.mtp_dir:
+        MTP_SRC = Path(a.mtp_dir).expanduser().resolve()
+    bundle = resolve_bundle(a.bundle)
+    if bundle:
+        OFFLINE = True
+        a.prebuilt = apply_bundle(bundle, a.prebuilt)
+        ok(f"offline pack: {bundle}")
+    elif OFFLINE:
+        ok("offline: no downloads, local files only")
+
     say("Strata - Qwen3.8-Flash-Next on a normal PC (NVIDIA GPU + system RAM + CPU)")
 
     # ---- 0. already installed: just start it
     have = installed_configs()
     if have and not (a.setup or a.model or a.family or a.check or a.no_start):
-        if not a.build:
+        if OFFLINE or WHEELS_DIR or (Path(sys.prefix) / ".strata-pip.json").exists():
+            pip_install(PY_PACKAGES, "numpy, jinja2, regex, pyyaml, tqdm, requests, cmake, ninja, pillow, psutil")
+            if (ROOT / "engine" / "BUILD.json").exists():
+                try:
+                    if json.loads((ROOT / "engine" / "BUILD.json").read_text()).get("source") != "local":
+                        pip_install(CUDA_WHEELS, "NVIDIA CUDA libraries (cuBLAS, CUDA runtime; ~0.4 GB)")
+                except (OSError, ValueError):
+                    pass
+        if not a.build and not OFFLINE:
             update_installed_engine(a.prebuilt)
         if len(have) == 1:
             return start(have[0], a.port)
@@ -908,13 +1221,24 @@ def main() -> int:
         ok("experimental speed projection: " + ("ON (experimental)" if esp else "off"))
     elif esp_choice.lower() not in ("", "off", "no", "n", "0"):
         warn("the experimental speed projection is made for the original Qwen3.8-Flash-Next, not Swift 1.5: left off")
-    models_dir = Path(a.gguf_dir) if a.gguf_dir else Path(a.models_dir) / tag
-    shards = [models_dir / fam["file"].format(q=model, i=i) for i in (1, 2)]
-    have_model = all(s.exists() and (done(s) or a.gguf_dir) for s in shards)
-    need = (0 if a.gguf_dir or have_model else MODELS[model]["download_gb"]) + 8 + \
+    models_root = Path(a.models_dir)
+    found = find_model_files(fam, model, models_root, Path(a.gguf_dir) if a.gguf_dir else None)
+    if all(found):
+        shards = found
+        models_dir = shards[0].parent
+        have_model = True
+    else:
+        models_dir = Path(a.gguf_dir) if a.gguf_dir else models_root / tag
+        shards = [models_dir / fam["file"].format(q=model, i=i) for i in (1, 2)]
+        have_model = all(gguf_ready(s) or (s.exists() and (done(s) or a.gguf_dir)) for s in shards)
+    need = (0 if have_model else MODELS[model]["download_gb"]) + 8 + \
         (40 if model == "Q2_0" and avx512 and family == "qwen" else 0) + (1 if vision != "none" else 0)
     if free_gb(models_dir) < need:
         fail(f"not enough free disk space in {models_dir}: need ~{need:.0f} GB", "use --models-dir on a bigger drive")
+    if OFFLINE and not have_model:
+        names = [fam["file"].format(q=model, i=i) for i in (1, 2)]
+        fail(f"offline: missing the model files ({names[0]})",
+             "pass --gguf-dir at the folder that already has both GGUF shards")
 
     # ---- 3. python packages
     step(3, "Python packages")
@@ -931,16 +1255,19 @@ def main() -> int:
             warn("the ready-made engine has no image encoder: compiling it")
             eng = None
     if eng is None:
+        if OFFLINE and not a.build:
+            fail("offline: the ready-made engine is not in the pack",
+                 "on a PC with internet run --export-offline and copy offline\\ here, or pass --prebuilt at the zip folder")
         eng = build_engine(gpu, vision, a.yes, llama)
     meta = json.loads((eng / "BUILD.json").read_text())
     lib_dirs = meta.get("cuda_dirs") or cuda_lib_dirs()
     ok(f"engine: {eng / EXE}")
 
     # ---- 5. the model files
-    step(5, f"downloading {fam['title']} {model}")
-    if not a.gguf_dir:
+    step(5, f"{'using local' if have_model or a.gguf_dir or OFFLINE else 'downloading'} {fam['title']} {model}")
+    if not have_model:
         for s in shards:
-            if s.exists() and done(s):
+            if gguf_ready(s) or (s.exists() and done(s)):
                 ok(f"{s.name} already downloaded")
                 continue
             # the original's shard 2 is the same file for all three sizes: reuse one that is already here
@@ -957,12 +1284,13 @@ def main() -> int:
     for s in shards:
         if not s.exists():
             fail(f"missing {s}")
+        if not done(s):
+            mark(s)
     ok("model files present")
-    mmproj = Path(a.models_dir) / fam["mmproj"]
+    mmproj = find_mmproj(fam, Path(a.models_dir), Path(a.gguf_dir) if a.gguf_dir else None)
     if vision != "none":
-        if not mmproj.exists() and a.gguf_dir and (Path(a.gguf_dir) / fam["mmproj"]).exists():
-            mmproj = Path(a.gguf_dir) / fam["mmproj"]
-        else:
+        if not mmproj.is_file():
+            mmproj = Path(a.models_dir) / fam["mmproj"]
             download(fam["mmproj_hf"] + fam["mmproj"], mmproj, "vision encoder")
         ok(f"vision encoder: {mmproj}")
 
@@ -987,19 +1315,29 @@ def main() -> int:
     mtp = ROOT / "mtp"
     rt = mtp / "rt"
     if not (rt / "experts.bin").exists():
-        say("  The MTP draft layer (speculative decoding, ~2x faster output) comes from the original Qwen checkpoint:")
-        say("  only its ~5 GB of MTP tensors are downloaded.")
-        run([sys.executable, str(ROOT / "tools" / "mtp_fetch.py"), "fetch", "--out", str(mtp)], env=env)
-        run([sys.executable, str(ROOT / "tools" / "mtp_pack.py"), "--src", str(mtp), "--experts", "q2_0",
-             "--out", str(mtp / "mtp-q2_0.gguf")], env=env)
-        run([sys.executable, str(ROOT / "tools" / "mtp_rt.py"), "--gguf", str(mtp / "mtp-q2_0.gguf"), "--out", str(rt)],
-            env=env)
+        if MTP_SRC and install_mtp_from(MTP_SRC, mtp):
+            ok(f"MTP copied from {MTP_SRC}")
+        elif OFFLINE:
+            fail("offline: the MTP draft layer is missing (mtp/rt/experts.bin)",
+                 "copy mtp\\ from the laptop pack, or pass --mtp-dir / --bundle")
+        else:
+            say("  The MTP draft layer (speculative decoding, ~2x faster output) comes from the original Qwen checkpoint:")
+            say("  only its ~5 GB of MTP tensors are downloaded.")
+            run([sys.executable, str(ROOT / "tools" / "mtp_fetch.py"), "fetch", "--out", str(mtp)], env=env)
+            run([sys.executable, str(ROOT / "tools" / "mtp_pack.py"), "--src", str(mtp), "--experts", "q2_0",
+                 "--out", str(mtp / "mtp-q2_0.gguf")], env=env)
+            run([sys.executable, str(ROOT / "tools" / "mtp_rt.py"), "--gguf", str(mtp / "mtp-q2_0.gguf"), "--out", str(rt)],
+                env=env)
     if not (rt / "draft_vocab.bin").exists():
         shutil.copyfile(ROOT / "data" / "draft_vocab.bin", rt / "draft_vocab.bin")
     ok(f"MTP draft layer: {rt}")
 
     # ---- 7. the start script
     step(7, "writing the start script")
+    profile = ROOT / "data" / "expert-profile.bin"
+    if not profile.is_file():
+        fail("data/expert-profile.bin is missing",
+             "it ships with the Strata release zip; copy it into data\\, or include it in the offline pack")
     sys.path.insert(0, str(ROOT / "tools"))
     from gguf_reader import GGUFFile                   # the PLE table's shard: shard 2 (original) or 1 (Swift)
     ple = next((s for s in shards if any(t.name == "per_layer_token_embd.weight" for t in GGUFFile(s).tensors)), None)

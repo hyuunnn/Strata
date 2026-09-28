@@ -88,6 +88,20 @@ window to stop the model.
 
 **Linux:** run `./setup.sh` - same questions, same result.
 
+**Closed network (no internet).** On a PC that can reach the internet, pack everything except the model:
+
+```
+START-HERE.bat --export-offline
+```
+
+That writes `offline\` (engine, Python wheels, MTP draft layer, Windows Python installer). Copy the Strata folder and `offline\` to the closed PC. The model GGUF files should already be there. Then:
+
+```
+START-HERE.bat --offline --gguf-dir D:\models\IQ2_XS --yes
+```
+
+`--gguf-dir` is the folder with both shards (the two `*.gguf` files). If `offline\` sits inside the Strata folder you can omit `--bundle`. NVIDIA driver 580+ must already be installed on the closed PC. Details: [Closed network](docs/DETAILS.md#closed-network-no-internet).
+
 ## Using it
 
 <p align="center"><img src="docs/media/runpagoda.png" width="900" alt="The Strata app's Monitor tab next to a coding agent"><br>

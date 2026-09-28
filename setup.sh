@@ -6,9 +6,17 @@ cd "$(dirname "$0")" || exit 1
 # python3-venv package), and a venv made without it has no pip
 ok_py() { "$1" -c 'import sys, venv, ensurepip; sys.exit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null; }
 # a .venv from an earlier run that failed half-way has a python but no pip: start it again
+if [ -x .venv/bin/python ] && ! .venv/bin/python -c 'import sys' >/dev/null 2>&1; then
+  echo "The copied Python environment does not work on this PC. Creating a new one ..."
+  rm -rf .venv
+fi
 if [ -x .venv/bin/python ] && ! .venv/bin/python -m pip --version >/dev/null 2>&1; then
   rm -rf .venv
 fi
+offline=0
+for a in "$@"; do
+  case "$a" in --offline|--bundle) offline=1 ;; --export-offline) offline=0 ;; esac
+done
 if [ ! -x .venv/bin/python ]; then
   PY=""
   for c in python3 python; do
@@ -16,6 +24,11 @@ if [ ! -x .venv/bin/python ]; then
       PY=$c; break
     fi
   done
+  if [ -z "$PY" ] && [ "$offline" = 1 ]; then
+    echo "Offline mode: Python 3.10+ with venv is not installed."
+    echo "Install it from this PC's package archive (Debian/Ubuntu: python3 python3-venv python3-pip), then run ./setup.sh again."
+    exit 1
+  fi
   if [ -z "$PY" ]; then
     echo "Python 3.10+ with venv is needed; installing it (sudo will ask for your password) ..."
     if command -v apt-get >/dev/null 2>&1; then

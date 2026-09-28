@@ -41,6 +41,7 @@ build-vision*/
 build-vision.bat
 
 # setup.py outputs (engine, downloads) and release builds
+/offline/
 /engine/
 /build-release*/
 /dist/

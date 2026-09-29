@@ -119,6 +119,8 @@ OFFLINE = False
 WHEELS_DIR = None          # Path | None: pip --find-links
 LLAMA_ZIP = None           # Path | None: llama.cpp source zip, instead of GitHub
 MTP_SRC = None             # Path | None: already-prepared MTP (rt/experts.bin)
+BUNDLE = None              # Path | None: the --export-offline folder in use
+PACK_PY = (3, 12)          # wheels and the bundled Windows installer are CPython 3.12
 
 
 # ------------------------------------------------------------------------------------------------ output
@@ -473,7 +475,7 @@ def pip_install(packages, what):
     say(f"  Installing {what} ...")
     cmd = [sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check"]
     if WHEELS_DIR:
-        cmd += ["--no-index", "--find-links", str(WHEELS_DIR)]
+        cmd += ["--no-index", "--only-binary=:all:", "--find-links", str(WHEELS_DIR)]
     elif OFFLINE:
         fail("Python packages are missing and there is no wheels folder",
              "on a PC with internet: START-HERE.bat --export-offline   then copy offline\\ here and pass --bundle")
@@ -536,13 +538,16 @@ def get_prebuilt(url_base, gpu, vision, updating=False) -> Path | None:
     meta = json.loads((tmp / "BUILD.json").read_text())
     if tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:3] if x.isdigit()) < MIN_ENGINE:
         need = ".".join(map(str, MIN_ENGINE))
+        shutil.rmtree(tmp, ignore_errors=True)
+        if OFFLINE:
+            fail(f"the engine in the offline pack is {meta.get('version')}; this setup needs {need}",
+                 "run --export-offline again on the internet PC so it downloads the current release")
         if updating:                                   # these files are newer than the published release (#58)
             warn(f"engine {need} is not published yet (the release may still be uploading): run this again "
                  f"in a few minutes to update it")
         else:
             warn(f"the ready-made engine at {base} is version {meta.get('version')}; this setup needs "
                  f"{need}: compiling instead")
-        shutil.rmtree(tmp, ignore_errors=True)
         return None
     archs = [int(a) for a in meta.get("archs", [])]
     arch = int(gpu["arch"])
@@ -1226,6 +1231,40 @@ def relocate_config(cfg_path: Path, cfg: dict) -> dict:
     return cfg
 
 
+def pack_meta(bundle: Path | None) -> dict:
+    if bundle is None:
+        return {}
+    path = bundle / "OFFLINE.json"
+    if not path.is_file():
+        return {}
+    try:
+        meta = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def check_offline_pack(bundle: Path | None) -> None:
+    """The pack's OS and the Python its wheels were built for. A Windows laptop on Python 3.13 must still
+    produce wheels the closed PC's bundled Python 3.12 can install."""
+    meta = pack_meta(bundle)
+    got = meta.get("os")
+    want = "windows" if WIN else "linux"
+    if got and got != want:
+        fail(f"this offline pack was built for {got}; this PC is {want}",
+             "run --export-offline on a PC with the same operating system as the closed PC "
+             "(the published engine zip is Windows)")
+    ver = str(meta.get("python_version") or "")
+    parts = ver.split(".")
+    need = (int(parts[0]), int(parts[1])) if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit() \
+        else (PACK_PY if WIN and (meta.get("python") or bundle) else None)
+    if need and sys.version_info[:2] != need:
+        hint = ("START-HERE.bat installs Python 3.12 from offline\\python; do not point it at another Python" if WIN
+                else "install Python 3.12 from this PC's packages and run ./setup.sh again")
+        fail(f"offline wheels are for Python {need[0]}.{need[1]}, this one is "
+             f"{sys.version_info[0]}.{sys.version_info[1]}", hint)
+
+
 def resolve_bundle(cli: str | None) -> Path | None:
     if cli:
         p = Path(cli).expanduser()
@@ -1240,7 +1279,8 @@ def resolve_bundle(cli: str | None) -> Path | None:
 
 def apply_bundle(bundle: Path, prebuilt: str) -> str:
     """Point llama / wheels / MTP / the engine zip at an --export-offline folder. Returns --prebuilt."""
-    global WHEELS_DIR, LLAMA_ZIP, MTP_SRC
+    global WHEELS_DIR, LLAMA_ZIP, MTP_SRC, BUNDLE
+    BUNDLE = bundle
     wheels = bundle / "wheels"
     if wheels.is_dir() and WHEELS_DIR is None:
         WHEELS_DIR = wheels
@@ -1255,7 +1295,7 @@ def apply_bundle(bundle: Path, prebuilt: str) -> str:
             MTP_SRC = bundle / "mtp" if (bundle / "mtp" / "rt" / "experts.bin").is_file() else mtp
             ok(f"MTP: {MTP_SRC}")
             break
-    for name in ("expert-profile.bin", "draft_vocab.bin"):
+    for name in ("expert-profile.bin", "expert-profile-coder.bin", "draft_vocab.bin"):
         src, dst = bundle / "data" / name, ROOT / "data" / name
         if src.is_file() and not dst.is_file():
             dst.parent.mkdir(parents=True, exist_ok=True)
@@ -1277,21 +1317,35 @@ def export_offline(dest: Path) -> int:
     say(f"Packing an offline folder at {dest}")
     say("  (the model GGUF files are not copied: point --gguf-dir at the ones already on the closed PC)")
     step(1, "ready-made engine")
+    # The published release ships a Windows engine only. A Windows pack without that zip cannot be installed
+    # on a closed network (compiling there would download the CUDA toolkit).
     if not download((PREBUILT_URL if PREBUILT_URL.endswith("/") else PREBUILT_URL + "/") + PREBUILT_ASSET,
-                    dest / PREBUILT_ASSET, "Strata engine", required=False):
+                    dest / PREBUILT_ASSET, "Strata engine", required=WIN):
         warn("no ready-made engine downloaded: on the closed PC the engine will have to be compiled")
     step(2, "llama.cpp source")
     download(LLAMA_CPP_ZIP, dest / f"llama.cpp-{LLAMA_CPP_COMMIT[:7]}.zip", "llama.cpp source")
     step(3, "Python wheels")
     wheels = dest / "wheels"
     wheels.mkdir(exist_ok=True)
-    run([sys.executable, "-m", "pip", "download", "--disable-pip-version-check", "-d", str(wheels),
-         *PY_PACKAGES, *CUDA_WHEELS])
-    ok(f"wheels: {wheels}")
+    # Always CPython 3.12 for this OS, not whatever Python happens to be running the export. One --abi cp312
+    # download also pulls the py3-none and abi3 wheels those packages depend on.
+    pip_cmd = [sys.executable, "-m", "pip", "download", "--disable-pip-version-check", "--only-binary=:all:",
+               "-d", str(wheels)]
     if WIN:
-        step(4, "Python installer")
+        pip_cmd += ["--platform", "win_amd64", "--python-version", "3.12", "--implementation", "cp", "--abi", "cp312"]
+    elif sys.version_info[:2] != PACK_PY:
+        fail(f"a Linux offline pack has to be exported with Python {PACK_PY[0]}.{PACK_PY[1]} "
+             f"(this one is {sys.version_info[0]}.{sys.version_info[1]})",
+             "the pack does not include a Linux Python installer, so the closed PC must use this same version")
+    run([*pip_cmd, *PY_PACKAGES, *CUDA_WHEELS])
+    ok(f"wheels: {wheels} (Python {PACK_PY[0]}.{PACK_PY[1]})")
+    step(4, "vision encoders")
+    for fam in FAMILIES.values():
+        download(fam["mmproj_hf"] + fam["mmproj"], dest / "models" / fam["mmproj"], fam["mmproj"], required=False)
+    if WIN:
+        step(5, "Python installer")
         download(PY_INSTALLER_URL, dest / "python" / PY_INSTALLER_NAME, "Python 3.12 installer")
-    step(5, "MTP draft layer")
+    step(6, "MTP draft layer")
     mtp, rt = ROOT / "mtp", ROOT / "mtp" / "rt"
     if not (rt / "experts.bin").is_file():
         pip_install(PY_PACKAGES, "numpy, jinja2, regex, pyyaml, tqdm, requests, cmake, ninja, pillow, psutil")
@@ -1310,8 +1364,8 @@ def export_offline(dest: Path) -> int:
         ok(f"MTP: {dest / 'mtp' / 'rt'}")
     else:
         warn("MTP was not packed; the closed PC will need mtp/rt/experts.bin")
-    step(6, "shipped data files")
-    for name in ("expert-profile.bin", "draft_vocab.bin"):
+    step(7, "shipped data files")
+    for name in ("expert-profile.bin", "expert-profile-coder.bin", "draft_vocab.bin"):
         src = ROOT / "data" / name
         if src.is_file():
             (dest / "data").mkdir(exist_ok=True)
@@ -1337,7 +1391,8 @@ def export_offline(dest: Path) -> int:
         "version": 1, "os": "windows" if WIN else "linux", "engine": PREBUILT_ASSET,
         "llama": f"llama.cpp-{LLAMA_CPP_COMMIT[:7]}.zip",
         "mtp": (dest / "mtp" / "rt" / "experts.bin").is_file(),
-        "wheels": True, "python": f"python/{PY_INSTALLER_NAME}" if WIN else None,
+        "wheels": True, "python_version": f"{PACK_PY[0]}.{PACK_PY[1]}",
+        "python": f"python/{PY_INSTALLER_NAME}" if WIN else None,
     }, indent=1), encoding="utf-8")
     say()
     say(f"Offline pack ready: {dest}")
@@ -1407,6 +1462,8 @@ def main() -> int:
         ok(f"offline pack: {bundle}")
     elif OFFLINE:
         ok("offline: no downloads, local files only")
+    if OFFLINE:
+        check_offline_pack(bundle)
 
     say("Strata - Qwen3.8-Flash-Next on a normal PC (NVIDIA GPU + system RAM + CPU)")
     data, elsewhere = data_folder(a.data_dir)          # the model files: in the data folder, found from any copy
@@ -1670,6 +1727,15 @@ def main() -> int:
             mark(s)
     ok("model files present")
     mmproj = find_mmproj(fam, Path(a.models_dir), Path(a.gguf_dir) if a.gguf_dir else None)
+    if not mmproj.is_file() and BUNDLE is not None:
+        packed = BUNDLE / "models" / fam["mmproj"]
+        if packed.is_file():
+            target = Path(a.models_dir) / fam["mmproj"]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.exists():
+                shutil.copyfile(packed, target)
+            mmproj = target
+            ok(f"vision encoder copied from the offline pack")
     if not mmproj.is_file():
         mmproj = find_in(roots, f"models/{fam['mmproj']}") or (Path(a.models_dir) / fam["mmproj"])
     if vision != "none":

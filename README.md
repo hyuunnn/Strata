@@ -116,7 +116,7 @@ the same way - nothing big is downloaded again.
 START-HERE.bat --export-offline
 ```
 
-That writes `offline\` (engine, Python wheels, MTP draft layer, Windows Python installer). Copy the Strata folder and `offline\` to the closed PC. The model GGUF files should already be there. Then:
+That writes `offline\` (engine, Python 3.12 wheels, MTP draft layer, Windows Python installer, vision encoder). Make this pack on Windows: the published engine is a Windows zip, and the wheels are for Python 3.12 even if the laptop's Python is newer. Copy the Strata folder and `offline\` to the closed PC. The model GGUF files are separate. Then:
 
 ```
 START-HERE.bat --offline --gguf-dir D:\models\IQ2_XS --yes

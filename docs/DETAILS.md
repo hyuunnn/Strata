@@ -272,10 +272,14 @@ START-HERE.bat --export-offline
 | `data\` | `expert-profile.bin` / `draft_vocab.bin` when they are in this tree |
 
 The ~70 GB model is **not** in the pack. Pass `--export-offline E:\usb\strata-offline` to write the pack onto a USB
-drive instead of `.\offline`.
+drive instead of `.\offline`. Make the pack on the **same OS** as the closed PC: the published engine zip is
+Windows, so a Windows closed PC needs `START-HERE.bat --export-offline` on a Windows laptop. The wheels are
+always for **Python 3.12**, even if the laptop's `python` is 3.11 or 3.13.
 
 **Copy to the closed PC:** the Strata source folder, the `offline\` pack, and the two GGUF shards (already there, or
-copied separately). The NVIDIA driver (580+) must already be installed.
+copied separately). The NVIDIA driver (580+) must already be installed. `START-HERE.bat` installs Python 3.12 from
+`offline\python` and does not reuse a different Python that is already on the PC. The vision encoder is in the pack
+(`offline\models`), so images can be turned on without the internet. The model GGUF files are still separate.
 
 **On the closed PC:**
 

@@ -13,16 +13,29 @@ if exist "offline\OFFLINE.json" if not defined EXPORTING (
   set "OFFLINE_MODE=1"
 )
 if exist ".venv\Scripts\python.exe" (
-  ".venv\Scripts\python.exe" -c "import sys" >nul 2>nul
-  if not errorlevel 1 goto run
-  echo  The copied Python environment does not work on this PC. Creating a new one ...
-  rmdir /s /q .venv
+  if defined OFFLINE_MODE (
+    ".venv\Scripts\python.exe" -c "import sys; sys.exit(0 if sys.version_info[:2]==(3, 12) else 1)" >nul 2>nul
+    if not errorlevel 1 goto run
+    echo  This offline pack needs a Python 3.12 environment. Creating it again ...
+    rmdir /s /q .venv
+  ) else (
+    ".venv\Scripts\python.exe" -c "import sys" >nul 2>nul
+    if not errorlevel 1 goto run
+    echo  The copied Python environment does not work on this PC. Creating a new one ...
+    rmdir /s /q .venv
+  )
 )
 
+if defined EXPORTING goto find_any
+if defined OFFLINE_MODE (
+  call :findpy312
+  if defined PY goto venv
+  goto py_offline
+)
+:find_any
 call :findpy
 if defined PY goto venv
-if defined EXPORTING goto py_online
-if defined OFFLINE_MODE goto py_offline
+goto py_online
 :py_online
 echo.
 echo  Python 3.10 or newer is not installed. Installing Python 3.12 for your user account ...
@@ -51,7 +64,7 @@ if not defined PYINST if exist "offline\python\python-3.12.10-amd64.exe" set "PY
 if defined PYINST (
   echo  Installing Python 3.12 from the offline pack ...
   "%PYINST%" /quiet InstallAllUsers=0 PrependPath=1 Include_launcher=1 Include_test=0
-  call :findpy
+  call :findpy312
   if defined PY goto venv
 )
 echo.
@@ -90,6 +103,14 @@ if not errorlevel 1 set "PY=py -3" & goto :eof
 python -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) and sys.maxsize > 2**32 else 1)" >nul 2>nul
 if not errorlevel 1 set "PY=python" & goto :eof
 for %%V in (313 312 311 310) do if exist "%LOCALAPPDATA%\Programs\Python\Python%%V\python.exe" set "PY="%LOCALAPPDATA%\Programs\Python\Python%%V\python.exe"" & goto :eof
+goto :eof
+
+:findpy312
+rem The offline wheels are CPython 3.12. py -3 would pick a newer install and pip would refuse the wheels.
+set "PY="
+py -3.12 -c "import sys; sys.exit(0 if sys.version_info[:2]==(3, 12) and sys.maxsize>2**32 else 1)" >nul 2>nul
+if not errorlevel 1 set "PY=py -3.12" & goto :eof
+if exist "%LOCALAPPDATA%\Programs\Python\Python312\python.exe" set "PY="%LOCALAPPDATA%\Programs\Python\Python312\python.exe"" & goto :eof
 goto :eof
 
 :parse_offline
